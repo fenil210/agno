@@ -21,6 +21,7 @@ from agno.agent import RunEvent
 from agno.os.interfaces.slack.helpers import member_name, task_id
 from agno.os.interfaces.slack.state import StreamState
 from agno.run.agent import BaseAgentRunEvent
+from agno.run.team import TeamRunEvent
 from agno.run.workflow import WorkflowRunEvent
 
 if TYPE_CHECKING:
@@ -147,6 +148,11 @@ _SUPPRESSED_IN_WORKFLOW: frozenset[str] = frozenset(
 )
 
 
+# =============================================================================
+# Handler Factory
+# =============================================================================
+
+
 def _make_wf_handler(
     prefix: str,
     label: str,
@@ -154,12 +160,23 @@ def _make_wf_handler(
     started: bool,
     name_attr: str = "step_name",
 ) -> _EventHandler:
-    # Factory for paired events that just call _wf_task with different params
+    """
+    Factory to create workflow event handlers for simple paired events.
+
+    This eliminates boilerplate for events that just call _wf_task with
+    different parameters (e.g., ParallelStarted, ConditionCompleted, etc.).
+    """
+
     async def handler(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
         await _wf_task(chunk, state, stream, prefix, label, started=started, name_attr=name_attr)
         return False
 
     return handler
+
+
+# =============================================================================
+# Agent/Team Event Handlers (require custom logic)
+# =============================================================================
 
 
 async def _on_reasoning_started(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
@@ -213,8 +230,9 @@ async def _on_tool_call_error(chunk: BaseRunOutputEvent, state: StreamState, str
 
 
 async def _on_run_content(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
-    # Suppress member agent content in team mode to avoid duplication — leader
-    # emits TeamRunContent which aggregates all member outputs into one response
+    # In team mode, member agents stream their own RunContentEvent (which extends
+    # BaseAgentRunEvent) before the leader synthesizes a TeamRunContent (which
+    # extends BaseTeamRunEvent). Showing both would duplicate content.
     if state.entity_type == "team" and isinstance(chunk, BaseAgentRunEvent):
         return False
     content = getattr(chunk, "content", None)
@@ -224,8 +242,9 @@ async def _on_run_content(chunk: BaseRunOutputEvent, state: StreamState, stream:
 
 
 async def _on_run_intermediate_content(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
-    # Team intermediate content arrives per-member as they finish — showing it
-    # would interleave partial outputs. Only agents show intermediate content.
+    # Teams emit intermediate content from each member as they finish. Showing
+    # these would interleave partial outputs in the stream. The team leader
+    # emits a single consolidated RunContent at the end — that's what we show.
     if state.entity_type != "team":
         content = getattr(chunk, "content", None)
         if content is not None:
@@ -258,24 +277,16 @@ async def _on_run_error(chunk: BaseRunOutputEvent, state: StreamState, stream: A
 
 
 async def _on_run_paused(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
-    # Stash the event; the router attaches one `card` block per pending
-    # requirement via stream.stop(blocks=...). The card carries the full
-    # approval context (tool name, args, Approve/Deny buttons) and coexists
-    # with the streaming plan above it.
-    print(f"[DEBUG] _on_run_paused called: run_id={getattr(chunk, 'run_id', None)}")
+    # For Teams: only stop on TeamRunPausedEvent (has team_id), not member RunPausedEvent.
+    # HITL card must carry Team's run_id — aget_run_output(member_run_id) fails at approval.
+    if state.entity_type == "team":
+        if getattr(chunk, "team_id", None) is None:
+            return False
+
     state.paused_event = cast(Union["AgentRunPausedEvent", "TeamRunPausedEvent"], chunk)
-    # Keep pending task_cards in-progress rather than flipping to complete —
-    # the run isn't finished, it's awaiting human input.
     state.terminal_status = "in_progress"
 
-    # Emit a "pending" task card for each paused requirement so the plan
-    # block above the awaiting indicator shows WHAT the agent is waiting on.
-    # Regular tool_call_started events create these for normal tools, but
-    # system tools like ask_user (user_feedback) bypass that event stream
-    # and pause directly — without this explicit emit, their bubble has no
-    # plan block and Slack's AI-Stream UI collapses the pairing, hiding
-    # the user's trigger from the thread pane.
-    from agno.os.interfaces.slack.types import _tool_name
+    from agno.os.interfaces.slack.types import tool_name
 
     requirements = list(getattr(chunk, "active_requirements", None) or [])
     for req in requirements:
@@ -283,31 +294,20 @@ async def _on_run_paused(chunk: BaseRunOutputEvent, state: StreamState, stream: 
         key = f"pause_req_{req_id}"
         if key in state.task_cards:
             continue
-        tool_label = _tool_name(req)
-        # Emit as "complete" — semantically "the agent has decided which
-        # tool to invoke, now awaiting human input". A non-complete status
-        # at stream.stop causes Slack's AI-Stream UI to render the bubble
-        # as "Something went wrong" with a red error icon, regardless of
-        # whether we transition to pending. The awaiting indicator and
-        # Card block posted below the bubble carry the actual pause state.
+        tool_label = tool_name(req)
+        # "complete" required — non-complete at stream.stop renders Slack error icon
         state.track_task(key, tool_label, "complete")
         await _emit_task(stream, key, tool_label, "complete")
 
-    # Fallback placeholder — only if we couldn't emit any task cards (e.g.
-    # requirements empty for some reason) and no prior tool content streamed.
-    # Without at least one non-empty block, Slack's AI-Stream UI collapses
-    # the question+response pairing and hides the trigger.
     if not state.has_content() and state.stream_chars_sent == 0 and not state.task_cards:
         await stream.append(markdown_text="_Reviewing request…_")
 
-    # The "⏸ Awaiting approval of <tool>…" indicator is posted by the
-    # router as a SEPARATE chat.postMessage in the same thread (see the
-    # pause path in attach_to_app). Posting it separately means we can
-    # chat.delete just that message once the user decides — preserving
-    # the tool-call audit trail in THIS streamed bubble (Thinking, prior
-    # tool calls) which would otherwise be collateral damage of any
-    # cleanup that targeted the streamed message.
     return True
+
+
+# =============================================================================
+# Workflow Event Handlers (require custom logic)
+# =============================================================================
 
 
 async def _on_step_output(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
@@ -362,6 +362,11 @@ async def _on_step_error(chunk: BaseRunOutputEvent, state: StreamState, stream: 
     return False
 
 
+# =============================================================================
+# Loop Event Handlers (custom logic for iteration tracking)
+# =============================================================================
+
+
 async def _on_loop_execution_started(chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
     step_name = getattr(chunk, "step_name", None) or "loop"
     loop_key = getattr(chunk, "step_id", None) or step_name
@@ -402,8 +407,16 @@ async def _on_loop_execution_completed(chunk: BaseRunOutputEvent, state: StreamS
     return False
 
 
-# Keys are normalized (no "Team" prefix) so agent + team events share handlers
+# =============================================================================
+# Dispatch Table
+# =============================================================================
+
+# Single dispatch table — keys are normalized (no "Team" prefix).
+# Workflow event names never start with "Team" so normalization is a no-op for them.
 HANDLERS: Dict[str, _EventHandler] = {
+    # -------------------------------------------------------------------------
+    # Agent/Team Events (normalized - use RunEvent values)
+    # -------------------------------------------------------------------------
     RunEvent.reasoning_started.value: _on_reasoning_started,
     RunEvent.reasoning_completed.value: _on_reasoning_completed,
     RunEvent.tool_call_started.value: _on_tool_call_started,
@@ -415,26 +428,34 @@ HANDLERS: Dict[str, _EventHandler] = {
     RunEvent.memory_update_completed.value: _on_memory_update_completed,
     RunEvent.run_completed.value: _on_run_completed,
     RunEvent.run_error.value: _on_run_error,
-    # Cancelled runs are terminal errors — user sees error status, not silent stop
-    RunEvent.run_cancelled.value: _on_run_error,
+    RunEvent.run_cancelled.value: _on_run_error,  # Treat cancellation as terminal error
     # HITL pause — stream ends, router posts Block Kit approval card separately
     RunEvent.run_paused.value: _on_run_paused,
+    TeamRunEvent.run_paused.value: _on_run_paused,
+    # -------------------------------------------------------------------------
     # Workflow Lifecycle Events
+    # -------------------------------------------------------------------------
     WorkflowRunEvent.step_output.value: _on_step_output,
     WorkflowRunEvent.workflow_started.value: _on_workflow_started,
     WorkflowRunEvent.workflow_completed.value: _on_workflow_completed,
     WorkflowRunEvent.workflow_error.value: _on_workflow_error,
     WorkflowRunEvent.workflow_cancelled.value: _on_workflow_error,
+    # -------------------------------------------------------------------------
     # Workflow Step Events
+    # -------------------------------------------------------------------------
     WorkflowRunEvent.step_started.value: _make_wf_handler("step", "", started=True),
     WorkflowRunEvent.step_completed.value: _make_wf_handler("step", "", started=False),
     WorkflowRunEvent.step_error.value: _on_step_error,
+    # -------------------------------------------------------------------------
     # Workflow Loop Events
+    # -------------------------------------------------------------------------
     WorkflowRunEvent.loop_execution_started.value: _on_loop_execution_started,
     WorkflowRunEvent.loop_iteration_started.value: _on_loop_iteration_started,
     WorkflowRunEvent.loop_iteration_completed.value: _on_loop_iteration_completed,
     WorkflowRunEvent.loop_execution_completed.value: _on_loop_execution_completed,
+    # -------------------------------------------------------------------------
     # Workflow Structural Events (factory-generated)
+    # -------------------------------------------------------------------------
     WorkflowRunEvent.parallel_execution_started.value: _make_wf_handler("parallel", "Parallel", started=True),
     WorkflowRunEvent.parallel_execution_completed.value: _make_wf_handler("parallel", "Parallel", started=False),
     WorkflowRunEvent.condition_execution_started.value: _make_wf_handler("cond", "Condition", started=True),
@@ -453,13 +474,19 @@ HANDLERS: Dict[str, _EventHandler] = {
 
 
 async def process_event(ev_raw: str, chunk: BaseRunOutputEvent, state: StreamState, stream: AsyncChatStream) -> bool:
-    import logging
+    """
+    Process a streaming event and update Slack accordingly.
 
-    logging.basicConfig(filename="/tmp/slack_events_debug.log", level=logging.DEBUG, force=True)
-    logger = logging.getLogger("slack_events")
-    # Strip "Team" prefix so agent + team events share handlers
-    ev = ev_raw.removeprefix("Team")
-    logger.warning(f"[DEBUG] process_event: {ev_raw} -> {ev}")
+    Args:
+        ev_raw: Raw event name (e.g., "ToolCallStarted", "TeamRunContent")
+        chunk: Stream chunk containing event data
+        state: StreamState tracking session state
+        stream: Slack chat_stream for sending updates
+
+    Returns:
+        True if this is a terminal event and the stream loop should break.
+    """
+    ev = _normalize_event(ev_raw)
 
     # Suppress nested agent internals in workflow mode
     if state.entity_type == "workflow" and ev in _SUPPRESSED_IN_WORKFLOW:
@@ -467,12 +494,6 @@ async def process_event(ev_raw: str, chunk: BaseRunOutputEvent, state: StreamSta
 
     handler = HANDLERS.get(ev)
     if handler:
-        result = await handler(chunk, state, stream)
-        if ev == "RunPaused":
-            print(
-                f"[DEBUG] RunPaused handler returned: {result}, paused_event set: {state.paused_event is not None}",
-                flush=True,
-            )
-        return result
+        return await handler(chunk, state, stream)
 
     return False

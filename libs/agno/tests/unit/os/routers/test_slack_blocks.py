@@ -2,19 +2,18 @@ from typing import Any, Dict
 
 from agno.models.response import ToolExecution
 from agno.os.interfaces.slack.builders import build_pause_message
-from agno.os.interfaces.slack.interactions import format_decision_title, parse_submit_payload
-from agno.os.interfaces.slack.types import (
+from agno.os.interfaces.slack.ids import (
     ACTION_EXTERNAL_RESULT,
     ACTION_FEEDBACK_SELECT,
     ACTION_INPUT_FIELD_PREFIX,
     ACTION_ROW_APPROVE,
     ACTION_ROW_REJECT,
     ACTION_SUBMIT,
-    ParsedDecision,
     parse_row_block_id,
     pause_block_id,
     row_block_id,
 )
+from agno.os.interfaces.slack.interactions import parse_submit_payload
 from agno.run.requirement import RunRequirement, UserFeedbackQuestion
 from agno.tools.function import UserFeedbackOption, UserInputField
 
@@ -288,7 +287,7 @@ class TestParseSubmitPayload:
         assert errors == []
         assert decisions[0].input_values == {"to_address": "you@example.com", "subject": "Q1 results"}
 
-    def test_user_input_bool_coerced(self):
+    def test_user_input_bool_value_returned_from_slack(self):
         req = _make_requirement(
             requires_user_input=True,
             user_input_schema=[UserInputField(name="force", field_type=bool)],
@@ -306,9 +305,9 @@ class TestParseSubmitPayload:
         )
         decisions, errors = parse_submit_payload(payload, [req])
         assert errors == []
-        assert decisions[0].input_values == {"force": True}
+        assert decisions[0].input_values == {"force": "true"}
 
-    def test_user_input_list_parsed_from_json(self):
+    def test_user_input_list_value_returned_from_slack(self):
         req = _make_requirement(
             requires_user_input=True,
             user_input_schema=[UserInputField(name="tags", field_type=list)],
@@ -323,9 +322,9 @@ class TestParseSubmitPayload:
         )
         decisions, errors = parse_submit_payload(payload, [req])
         assert errors == []
-        assert decisions[0].input_values == {"tags": ["a", "b"]}
+        assert decisions[0].input_values == {"tags": '["a","b"]'}
 
-    def test_user_input_bad_json_records_error(self):
+    def test_user_input_plain_text_value_does_not_require_json_parsing(self):
         req = _make_requirement(
             requires_user_input=True,
             user_input_schema=[UserInputField(name="tags", field_type=list)],
@@ -339,9 +338,8 @@ class TestParseSubmitPayload:
             }
         )
         decisions, errors = parse_submit_payload(payload, [req])
-        assert len(errors) == 1
-        assert errors[0].field == "tags"
-        assert decisions[0].input_values == {"tags": None}
+        assert errors == []
+        assert decisions[0].input_values == {"tags": "not json"}
 
     def test_confirmation_legacy_decided_block_id(self):
         # Backwards-compat — older messages use section + decided block_id.
@@ -406,56 +404,156 @@ class TestParseSubmitPayload:
         assert errors[0].requirement_id == "r1"
 
 
-class TestFormatDecisionTitle:
-    def test_approved_confirmation_inlines_args(self):
-        req = _make_requirement(
+# -- _build_confirmation_toggle_card --
+
+
+class TestBuildConfirmationToggleCard:
+    def test_approve_selected_has_primary_style(self):
+        from agno.os.interfaces.slack.builders import build_confirmation_toggle_card
+
+        card = build_confirmation_toggle_card(
+            req_id="r1",
+            run_id="A1",
+            awaiting_ts="123.456",
+            tool_name="delete_file",
+            body_text="• path: `/tmp/x`",
+            selected="approve",
+        )
+        assert card.block_id == "rowact:r1:confirmation:selected:approve"
+        approve_btn = card.actions[0]
+        assert approve_btn.text.text == "Approved"
+        assert approve_btn.style == "primary"
+
+    def test_deny_selected_has_danger_style(self):
+        from agno.os.interfaces.slack.builders import build_confirmation_toggle_card
+
+        card = build_confirmation_toggle_card(
+            req_id="r1",
+            run_id="A1",
+            awaiting_ts=None,
+            tool_name="delete_file",
+            body_text="• path: `/tmp/x`",
+            selected="deny",
+        )
+        assert card.block_id == "rowact:r1:confirmation:selected:deny"
+        deny_btn = card.actions[1]
+        assert deny_btn.text.text == "Denied"
+        assert deny_btn.style == "danger"
+
+    def test_preserves_tool_name_and_body(self):
+        from agno.os.interfaces.slack.builders import build_confirmation_toggle_card
+
+        card = build_confirmation_toggle_card(
+            req_id="r1",
+            run_id="A1",
+            awaiting_ts=None,
             tool_name="cancel_subscription",
-            tool_args={"customer_id": "C-42", "reason": "pricing"},
+            body_text="• customer_id: `C-42`",
+            selected="approve",
         )
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=True)
-        assert format_decision_title(decision, req) == "Approved: cancel_subscription(customer_id=C-42, reason=pricing)"
+        assert card.title.text == "*cancel_subscription*"
+        assert card.body.text == "• customer_id: `C-42`"
 
-    def test_denied_confirmation_inlines_args(self):
-        req = _make_requirement(
-            tool_name="cancel_subscription",
-            tool_args={"customer_id": "C-42", "reason": "pricing"},
-        )
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=False)
-        assert format_decision_title(decision, req) == "Denied: cancel_subscription(customer_id=C-42, reason=pricing)"
 
-    def test_confirmation_empty_args_no_parens(self):
-        req = _make_requirement(tool_name="cancel_subscription", tool_args={})
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=True)
-        assert format_decision_title(decision, req) == "Approved: cancel_subscription"
+# -- response_blocks --
 
-    def test_value_over_40_chars_truncates(self):
-        req = _make_requirement(
-            tool_name="cancel_subscription",
-            tool_args={"reason": "a" * 60},
-        )
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=True)
-        result = format_decision_title(decision, req)
-        # Long value truncated to 40 chars (39 + ellipsis).
-        assert "reason=" in result
-        assert "…" in result
-        assert "a" * 60 not in result
 
-    def test_title_over_120_chars_truncates(self):
-        # Several medium-length args that together exceed the 120-char cap.
-        req = _make_requirement(
-            tool_name="very_long_tool_name_indeed",
-            tool_args={f"arg{i}": "x" * 30 for i in range(5)},
-        )
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=True)
-        result = format_decision_title(decision, req)
-        assert len(result) <= 120
-        assert result.endswith("…")
+class TestResponseBlocks:
+    def test_strips_actions_from_cards(self):
+        from agno.os.interfaces.slack.builders import response_blocks
 
-    def test_newlines_stripped_from_values(self):
-        req = _make_requirement(
-            tool_name="run_diagnostic",
-            tool_args={"command": "line1\nline2\nline3"},
-        )
-        decision = ParsedDecision(requirement_id="r1", pause_type="confirmation", approved=True)
-        result = format_decision_title(decision, req)
-        assert "\n" not in result
+        original = [{"type": "card", "block_id": "rowact:r1:confirmation", "actions": [{"type": "button"}]}]
+        result = response_blocks(original, {}, [])
+        assert "actions" not in result[0]
+
+    def test_converts_selected_approve_to_approved_title(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {
+                "type": "card",
+                "block_id": "rowact:r1:confirmation:selected:approve",
+                "title": {"type": "mrkdwn", "text": "*delete_file*"},
+                "actions": [],
+            }
+        ]
+        result = response_blocks(original, {}, [])
+        assert result[0]["title"]["text"] == "*Approved:* delete_file"
+
+    def test_converts_selected_deny_to_denied_title(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {
+                "type": "card",
+                "block_id": "rowact:r1:confirmation:selected:deny",
+                "title": {"type": "mrkdwn", "text": "*delete_file*"},
+                "actions": [],
+            }
+        ]
+        result = response_blocks(original, {}, [])
+        assert result[0]["title"]["text"] == "*Denied:* delete_file"
+
+    def test_skips_actions_blocks(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {"type": "card", "block_id": "x", "actions": []},
+            {"type": "actions", "block_id": "pause:A1"},
+        ]
+        result = response_blocks(original, {}, [])
+        assert len(result) == 1
+        assert result[0]["type"] == "card"
+
+    def test_skips_reject_reason_inputs(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {"type": "input", "block_id": "reject_reason:r1"},
+            {"type": "card", "block_id": "x", "actions": []},
+        ]
+        result = response_blocks(original, {}, [])
+        assert len(result) == 1
+        assert result[0]["type"] == "card"
+
+    def test_builds_submitted_card_from_input_values(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {
+                "type": "input",
+                "block_id": "row:r1:user_input:field1",
+                "label": {"type": "plain_text", "text": "Email"},
+                "element": {"type": "plain_text_input", "action_id": "input_field:field1"},
+            }
+        ]
+        state_values = {
+            "row:r1:user_input:field1": {
+                "input_field:field1": {"type": "plain_text_input", "value": "test@example.com"}
+            }
+        }
+        result = response_blocks(original, state_values, [])
+        submitted_card = result[-1]
+        assert submitted_card["type"] == "card"
+        assert submitted_card["title"]["text"] == "*Submitted*"
+        assert "Email" in submitted_card["body"]["text"]
+        assert "test@example.com" in submitted_card["body"]["text"]
+
+    def test_truncates_body_over_200_chars(self):
+        from agno.os.interfaces.slack.builders import response_blocks
+
+        original = [
+            {
+                "type": "input",
+                "block_id": "row:r1:user_input:field1",
+                "label": {"type": "plain_text", "text": "Data"},
+                "element": {"type": "plain_text_input", "action_id": "input_field:field1"},
+            }
+        ]
+        state_values = {
+            "row:r1:user_input:field1": {"input_field:field1": {"type": "plain_text_input", "value": "x" * 300}}
+        }
+        result = response_blocks(original, state_values, [])
+        submitted_card = result[-1]
+        assert len(submitted_card["body"]["text"]) <= 200
+        assert submitted_card["body"]["text"].endswith("...")
