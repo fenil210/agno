@@ -11,7 +11,8 @@ from agno.models.message import Message
 from agno.models.metrics import MessageMetrics
 from agno.models.response import ModelResponse
 from agno.run.agent import RunOutput
-from agno.utils.log import log_debug, log_error, log_warning
+from agno.utils.log import log_debug, log_error, log_info, log_warning
+from agno.utils.models.claude import supports_prefill
 from agno.utils.tokens import count_schema_tokens
 
 try:
@@ -77,10 +78,17 @@ class AwsBedrock(Model):
     top_p: Optional[float] = None
     stop_sequences: Optional[List[str]] = None
     request_params: Optional[Dict[str, Any]] = None
+    append_trailing_user_message: Optional[bool] = None
+    trailing_user_message_content: str = "continue"
 
     client: Optional[AwsClient] = None
     async_client: Optional[Any] = None
     async_session: Optional[Any] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.append_trailing_user_message is None:
+            self.append_trailing_user_message = not supports_prefill(self.id)
 
     def get_client(self) -> AwsClient:
         """
@@ -308,6 +316,10 @@ class AwsBedrock(Model):
         Returns:
             Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]: The formatted messages.
         """
+        from agno.utils.message import normalize_tool_messages
+
+        # Backwards compat: expand old Gemini combined tool messages into individual canonical messages
+        messages = normalize_tool_messages(messages)
 
         formatted_messages: List[Dict[str, Any]] = []
         system_message = None
@@ -320,8 +332,16 @@ class AwsBedrock(Model):
                     "toolUseId": message.tool_call_id,
                     "content": [{"json": {"result": content}}],
                 }
-                formatted_message: Dict[str, Any] = {"role": "user", "content": [{"toolResult": tool_result}]}
-                formatted_messages.append(formatted_message)
+                if (
+                    formatted_messages
+                    and formatted_messages[-1]["role"] == "user"
+                    and formatted_messages[-1]["content"]
+                    and "toolResult" in formatted_messages[-1]["content"][0]
+                ):
+                    formatted_messages[-1]["content"].append({"toolResult": tool_result})
+                else:
+                    formatted_message: Dict[str, Any] = {"role": "user", "content": [{"toolResult": tool_result}]}
+                    formatted_messages.append(formatted_message)
             else:
                 formatted_message = {"role": message.role, "content": []}
                 if isinstance(message.content, list):
@@ -337,7 +357,7 @@ class AwsBedrock(Model):
                             else:
                                 tool_input = json.loads(arguments)
                         except (json.JSONDecodeError, KeyError) as e:
-                            log_warning(f"Failed to parse tool call arguments: {e}")
+                            log_warning(f"Failed to parse tool call arguments: {str(e)}")
                             tool_input = {}
 
                         tool_use_content.append(
@@ -431,6 +451,13 @@ class AwsBedrock(Model):
                         )
 
                 formatted_messages.append(formatted_message)
+
+        # Claude 4.6+ models do not support assistant message prefill.
+        # Append a trailing user turn so the request ends with a user message.
+        if self.append_trailing_user_message and formatted_messages and formatted_messages[-1]["role"] == "assistant":
+            log_info("Appending trailing user message because this model does not support assistant message prefill")
+            formatted_messages.append({"role": "user", "content": [{"text": self.trailing_user_message_content}]})
+
         # TODO: Add caching: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
         return formatted_messages, system_message
 
@@ -460,7 +487,7 @@ class AwsBedrock(Model):
 
             return tokens
         except Exception as e:
-            log_warning(f"Failed to count tokens via Bedrock API: {e}")
+            log_warning(f"Failed to count tokens via Bedrock API: {str(e)}")
             return super().count_tokens(messages, tools, output_schema)
 
     async def acount_tokens(
@@ -490,7 +517,7 @@ class AwsBedrock(Model):
 
             return tokens
         except Exception as e:
-            log_warning(f"Failed to count tokens via Bedrock API: {e}")
+            log_warning(f"Failed to count tokens via Bedrock API: {str(e)}")
             return await super().acount_tokens(messages, tools, output_schema)
 
     def invoke(

@@ -28,7 +28,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from os import getenv
 from textwrap import dedent
-from typing import Any, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 from agno.learn.config import LearningMode, UserMemoryConfig
 from agno.learn.schemas import Memories
@@ -40,6 +40,10 @@ from agno.utils.log import (
     set_log_level_to_debug,
     set_log_level_to_info,
 )
+from agno.utils.message import get_conversation_text
+
+if TYPE_CHECKING:
+    from agno.metrics import RunMetrics
 
 try:
     from agno.db.base import AsyncBaseDb, BaseDb
@@ -141,7 +145,7 @@ class UserMemoryStore(LearningStore):
             user_id=user_id,
             agent_id=agent_id,
             team_id=team_id,
-            run_response=kwargs.get("run_response"),
+            run_metrics=kwargs.get("run_metrics"),
         )
 
     async def aprocess(
@@ -164,7 +168,7 @@ class UserMemoryStore(LearningStore):
             user_id=user_id,
             agent_id=agent_id,
             team_id=team_id,
-            run_response=kwargs.get("run_response"),
+            run_metrics=kwargs.get("run_metrics"),
         )
 
     def build_context(self, data: Any) -> str:
@@ -746,7 +750,7 @@ class UserMemoryStore(LearningStore):
         user_id: str,
         agent_id: Optional[str] = None,
         team_id: Optional[str] = None,
-        run_response: Optional[Any] = None,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         """Extract memories from messages and save.
 
@@ -771,14 +775,16 @@ class UserMemoryStore(LearningStore):
 
         self.memories_updated = False
 
+        conversation_text = get_conversation_text(messages)
+        if not conversation_text.strip():
+            return "No updates needed"
+
         existing_memories = self.get(user_id=user_id)
         existing_data = self._memories_to_list(memories=existing_memories)
 
-        input_string = self._messages_to_input_string(messages=messages)
-
         tools = self._get_extraction_tools(
             user_id=user_id,
-            input_string=input_string,
+            input_string=conversation_text,
             existing_memories=existing_memories,
             agent_id=agent_id,
             team_id=team_id,
@@ -788,7 +794,7 @@ class UserMemoryStore(LearningStore):
 
         messages_for_model = [
             self._get_system_message(existing_data=existing_data),
-            *messages,
+            Message(role="user", content=conversation_text),
         ]
 
         model_copy = deepcopy(self.model)
@@ -797,10 +803,10 @@ class UserMemoryStore(LearningStore):
             tools=functions,
         )
 
-        if run_response is not None and response.response_usage is not None:
+        if run_metrics is not None and response.response_usage is not None:
             from agno.metrics import ModelType, accumulate_model_metrics
 
-            accumulate_model_metrics(response, model_copy, ModelType.LEARNING_MODEL, run_response)
+            accumulate_model_metrics(response, model_copy, ModelType.LEARNING_MODEL, run_metrics)
 
         if response.tool_executions:
             self.memories_updated = True
@@ -815,7 +821,7 @@ class UserMemoryStore(LearningStore):
         user_id: str,
         agent_id: Optional[str] = None,
         team_id: Optional[str] = None,
-        run_response: Optional[Any] = None,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         """Async version of extract_and_save."""
         if self.model is None:
@@ -830,14 +836,16 @@ class UserMemoryStore(LearningStore):
 
         self.memories_updated = False
 
+        conversation_text = get_conversation_text(messages)
+        if not conversation_text.strip():
+            return "No updates needed"
+
         existing_memories = await self.aget(user_id=user_id)
         existing_data = self._memories_to_list(memories=existing_memories)
 
-        input_string = self._messages_to_input_string(messages=messages)
-
         tools = await self._aget_extraction_tools(
             user_id=user_id,
-            input_string=input_string,
+            input_string=conversation_text,
             existing_memories=existing_memories,
             agent_id=agent_id,
             team_id=team_id,
@@ -847,7 +855,7 @@ class UserMemoryStore(LearningStore):
 
         messages_for_model = [
             self._get_system_message(existing_data=existing_data),
-            *messages,
+            Message(role="user", content=conversation_text),
         ]
 
         model_copy = deepcopy(self.model)
@@ -856,10 +864,10 @@ class UserMemoryStore(LearningStore):
             tools=functions,
         )
 
-        if run_response is not None and response.response_usage is not None:
+        if run_metrics is not None and response.response_usage is not None:
             from agno.metrics import ModelType, accumulate_model_metrics
 
-            accumulate_model_metrics(response, model_copy, ModelType.LEARNING_MODEL, run_response)
+            accumulate_model_metrics(response, model_copy, ModelType.LEARNING_MODEL, run_metrics)
 
         if response.tool_executions:
             self.memories_updated = True
@@ -945,13 +953,6 @@ class UserMemoryStore(LearningStore):
 
         return result
 
-    def _messages_to_input_string(self, messages: List["Message"]) -> str:
-        """Convert messages to input string."""
-        if len(messages) == 1:
-            return messages[0].get_content_string()
-        else:
-            return "\n".join([f"{m.role}: {m.get_content_string()}" for m in messages if m.content])
-
     def _build_functions_for_model(self, tools: List[Callable]) -> List["Function"]:
         """Convert callables to Functions for model."""
         from agno.tools.function import Function
@@ -971,7 +972,7 @@ class UserMemoryStore(LearningStore):
                 functions.append(func)
                 log_debug(f"Added function {func.name}")
             except Exception as e:
-                log_warning(f"Could not add function {tool}: {e}")
+                log_warning(f"Could not add function {tool}: {str(e)}")
 
         return functions
 
@@ -1177,7 +1178,7 @@ class UserMemoryStore(LearningStore):
                     log_debug(f"Memory added: {memory[:50]}...")
                     return f"Memory saved: {memory}"
                 except Exception as e:
-                    log_warning(f"Error adding memory: {e}")
+                    log_warning(f"Error adding memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(add_memory)
@@ -1219,7 +1220,7 @@ class UserMemoryStore(LearningStore):
 
                     return "No memories field"
                 except Exception as e:
-                    log_warning(f"Error updating memory: {e}")
+                    log_warning(f"Error updating memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(update_memory)
@@ -1260,7 +1261,7 @@ class UserMemoryStore(LearningStore):
 
                     return "No memories field"
                 except Exception as e:
-                    log_warning(f"Error deleting memory: {e}")
+                    log_warning(f"Error deleting memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(delete_memory)
@@ -1278,7 +1279,7 @@ class UserMemoryStore(LearningStore):
                     log_debug("All memories cleared")
                     return "All memories cleared"
                 except Exception as e:
-                    log_warning(f"Error clearing memories: {e}")
+                    log_warning(f"Error clearing memories: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(clear_all_memories)
@@ -1334,7 +1335,7 @@ class UserMemoryStore(LearningStore):
                     log_debug(f"Memory added: {memory[:50]}...")
                     return f"Memory saved: {memory}"
                 except Exception as e:
-                    log_warning(f"Error adding memory: {e}")
+                    log_warning(f"Error adding memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(add_memory)
@@ -1378,7 +1379,7 @@ class UserMemoryStore(LearningStore):
 
                     return "No memories field"
                 except Exception as e:
-                    log_warning(f"Error updating memory: {e}")
+                    log_warning(f"Error updating memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(update_memory)
@@ -1421,7 +1422,7 @@ class UserMemoryStore(LearningStore):
 
                     return "No memories field"
                 except Exception as e:
-                    log_warning(f"Error deleting memory: {e}")
+                    log_warning(f"Error deleting memory: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(delete_memory)
@@ -1439,7 +1440,7 @@ class UserMemoryStore(LearningStore):
                     log_debug("All memories cleared")
                     return "All memories cleared"
                 except Exception as e:
-                    log_warning(f"Error clearing memories: {e}")
+                    log_warning(f"Error clearing memories: {str(e)}")
                     return f"Error: {e}"
 
             functions.append(clear_all_memories)
